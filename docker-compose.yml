@@ -1,0 +1,10 @@
+services:
+  web:
+    image: php:8.5-apache
+    container_name: webGpu
+    user: "${UID}:${GID}"
+    ports:
+      - "2500:80"
+    volumes:
+      - ./main:/var/www/html
+    restart: unless-stopped
