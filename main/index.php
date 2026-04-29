@@ -2,11 +2,12 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8" />
-    <title>WebGPU Triangle</title>
+    <title>WebGPU Compute Test</title>
     <style>
         body {
             margin: 0;
-            background: #ffff;
+            background: #fff;
+            display: flex;
             justify-content: center;
             align-items: center;
             height: 100vh;
@@ -33,10 +34,8 @@
 
         const device = await adapter.requestDevice();
 
-        // Canvas setup
+        // Canvas (not used yet, but kept)
         const canvas = document.querySelector("#gpuCanvas");
-        if (!canvas) throw new Error("Canvas not found");
-
         const context = canvas.getContext("webgpu");
         const format = navigator.gpu.getPreferredCanvasFormat();
 
@@ -46,25 +45,127 @@
             alphaMode: "premultiplied",
         });
 
-        // Shader (WGSL)
-        const shaderCode = await fetch("./shaders/shader.wgsl").then(r => r.text());
+        // ===== COMPUTE SETUP =====
+        const NUM_ELEMENTS = 1000;
+        const BUFFER_SIZE = NUM_ELEMENTS * 4;
+
+        const shaderCompile = `
+            @group(0) @binding(0)
+            var<storage, read_write> output: array<f32>;
+
+            @compute @workgroup_size(64)
+            fn main(
+                @builtin(global_invocation_id) global_id : vec3u,
+                @builtin(local_invocation_id) local_id : vec3u,
+            ) {
+                if (global_id.x >= ${NUM_ELEMENTS}) {
+                    return;
+                }
+
+                output[global_id.x] =
+                    f32(global_id.x) * 1 + f32(local_id.x);
+            }
+    `;
 
         const shaderModule = device.createShaderModule({
-            code: shaderCode,
+            code: shaderCompile,
         });
 
-        const res = await fetch("./shaders/config/vertexJson.json");
-        const vertexData = await res.json();
+        const output = device.createBuffer({
+            size: BUFFER_SIZE,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+        });
 
-        const vertices = new Float32Array(vertexData.triangle);
+        const stagingBuffer = device.createBuffer({
+            size: BUFFER_SIZE,
+            usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+        });
 
+        const bindGroupLayout = device.createBindGroupLayout({
+            entries: [
+                {
+                    binding: 0,
+                    visibility: GPUShaderStage.COMPUTE,
+                    buffer: { type: "storage" },
+                },
+            ],
+        });
+
+        const bindGroup = device.createBindGroup({
+            layout: bindGroupLayout,
+            entries: [
+                {
+                    binding: 0,
+                    resource: { buffer: output },
+                },
+            ],
+        });
+
+        const computePipeline = device.createComputePipeline({
+            layout: device.createPipelineLayout({
+                bindGroupLayouts: [bindGroupLayout],
+            }),
+            compute: {
+                module: shaderModule,
+                entryPoint: "main",
+            },
+        });
+
+        const commandEncoder = device.createCommandEncoder();
+        const passEncoder = commandEncoder.beginComputePass();
+
+        passEncoder.setPipeline(computePipeline);
+        passEncoder.setBindGroup(0, bindGroup);
+        passEncoder.dispatchWorkgroups(Math.ceil(NUM_ELEMENTS / 64));
+        passEncoder.end();
+
+        // Copy GPU → CPU buffer
+        commandEncoder.copyBufferToBuffer(
+            output,
+            0,
+            stagingBuffer,
+            0,
+            BUFFER_SIZE
+        );
+
+        // Submit work
+        device.queue.submit([commandEncoder.finish()]);
+
+        // Read result
+        await stagingBuffer.mapAsync(GPUMapMode.READ);
+
+        const copyArrayBuffer = stagingBuffer.getMappedRange();
+        const data = copyArrayBuffer.slice();
+        stagingBuffer.unmap();
+
+        console.log("Result:", new Float32Array(data));
+
+
+        // ========== SEP 3 — COMPUTE SHADER ==========
+        const shaderTriangle = await fetch("./shaders/triangleShader.wgsl").then(r => r.text());
+        const shaderModuleTriangle = device.createShaderModule({
+            code: shaderTriangle,
+        });
+
+        const sampleSize = 24;
+
+        const copy = [...new Float32Array(data)];
+
+        for (let i = copy.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [copy[i], copy[j]] = [copy[j], copy[i]];
+        }
+
+        const sampled = copy.slice(0, sampleSize);
+
+        const vertices = new Float32Array(sampled);
+
+        // ========== SEP 4 — BUFFERS ==========
         const vertexBuffer = device.createBuffer({
             size: vertices.byteLength,
             usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
         });
-
         device.queue.writeBuffer(vertexBuffer, 0, vertices);
-
         const vertexBuffers = [
             {
                 arrayStride: 32,
@@ -83,16 +184,18 @@
             },
         ];
 
-        // Pipeline
+        // ========== SEP 5 — BIND GROUP ==========
+
+        // ========== SEP 6 — PIPELINE ==========
         const pipeline = device.createRenderPipeline({
             layout: "auto",
             vertex: {
-                module: shaderModule,
+                module: shaderModuleTriangle,
                 entryPoint: "vertex_main",
                 buffers: vertexBuffers,
             },
             fragment: {
-                module: shaderModule,
+                module: shaderModuleTriangle,
                 entryPoint: "fragment_main",
                 targets: [{ format }],
             },
@@ -101,12 +204,13 @@
             },
         });
 
+        // ========== SEP 7 — ENCODE + DISPATCH ==========
         // Render
-        const commandEncoder = device.createCommandEncoder();
+        const commandEncoderTriangle = device.createCommandEncoder();
 
         const textureView = context.getCurrentTexture().createView();
 
-        const renderPass = commandEncoder.beginRenderPass({
+        const renderPass = commandEncoderTriangle.beginRenderPass({
             colorAttachments: [
                 {
                     view: textureView,
@@ -116,134 +220,37 @@
                 },
             ],
         });
-
+        // ========== SEP 8 — READ BACK CPU ==========
         renderPass.setPipeline(pipeline);
         renderPass.setVertexBuffer(0, vertexBuffer);
         renderPass.draw(3);
         renderPass.end();
 
-        device.queue.submit([commandEncoder.finish()]);
+        device.queue.submit([commandEncoderTriangle.finish()]);
     }
 
+    /* think points :
+    // ========== SEP 1 — GPU INIT ==========
+
+// ========== SEP 2 — CANVAS SETUP ==========
+
+// ========== SEP 3 — COMPUTE SHADER ==========
+
+// ========== SEP 4 — BUFFERS ==========
+
+// ========== SEP 5 — BIND GROUP ==========
+
+// ========== SEP 6 — PIPELINE ==========
+
+// ========== SEP 7 — ENCODE + DISPATCH ==========
+
+// ========== SEP 8 — READ BACK CPU ==========
+     */
     init().catch(err => {
         console.error(err);
         alert(err.message);
     });
 </script>
-<br><br>
-<div>
-<?PHP
-    function newFile($fileDir,$typeStartFile = false){
-        // starter
-        if($typeStartFile === false){
-            $starterData = ["triangle" => [
-                0.0,  0.6, 0.0, 1.0,  1.0, 0.0, 0.0, 1.0,
-                -0.5, -0.6, 0.0, 1.0,  0.0, 1.0, 0.0, 1.0,
-                0.5, -0.6, 0.0, 1.0,  0.0, 0.0, 1.0, 1.0,
-            ]];
-            file_put_contents($fileDir,json_encode($starterData));
-            return;
-        }
-        die("Wrong Starter Option chosen!!");
-    }
-    function init(){
-        // hardcoded but will be fixed in future if need diff
-        $jsonFileName = "./shaders/config/vertexJson.json";
 
-        if(!file_exists("./".$jsonFileName)){
-            newFile($jsonFileName);
-        }
-
-        // if config is updated by configScreen
-        // note to self this is heavly unsafe due no checks but for now it works
-        if(isset($_POST) && isset($_POST["reset"])){
-            resetConfig($jsonFileName,$_POST["reset"]);
-        }
-        if(isset($_POST) && isset($_POST["3Dtype"])){
-            updateConfig($jsonFileName,$_POST);
-        }
-
-        // errors
-        $fileContent = json_decode(file_get_contents($jsonFileName),true);
-        if(!$fileContent){
-            die("no config content");
-        }
-
-
-
-        // render configScreen
-        configScreen($fileContent);
-
-    }
-    function configScreen($data){
-        echo "<div class='container'>";
-            foreach($data as $configType => $configValues){
-                echo "<h2>".$configType."</h2>";
-                echo "<form method='post' action='#'>";
-                echo "<input hidden name='3Dtype' value='".$configType."'>";
-                $count = 0;
-                $id = 0;
-                $maxCount = 5;
-                foreach($configValues as $configValue){
-                    $count++;
-                    $id++;
-                    if($count === $maxCount){
-                        echo "<input class='3dConfig' step='0.1' name='".$id."' value='".$configValue."' type='number'/>";
-                        $count = 0;
-                        continue;
-                    }
-                    echo "<input class='3dConfig' step='0.1' name='".$id."' value='".$configValue."' type='number'/>";
-                }
-                echo "<br><input type='submit' value='Set Values'>";
-                echo "</form>";
-                // reset button
-                echo "<form action='#' method='post'>";
-                echo "<input hidden name='reset' value='".$configType."'";
-                echo "<br><input type='submit' value='RESET - {$configType}'>";
-
-                echo "</form>";
-            }
-        echo "</div>";
-    }
-    function resetConfig($file,$typeReset){
-        // temp switch
-
-        if($typeReset === "triangle") {
-          $resetArr = [
-                        0.0,  0.6, 0.0, 1.0,  1.0, 0.0, 0.0, 1.0,
-                        -0.5, -0.6, 0.0, 1.0,  0.0, 1.0, 0.0, 1.0,
-                        0.5, -0.6, 0.0, 1.0,  0.0, 0.0, 1.0, 1.0,
-            ];
-        } else {
-            return;
-        }
-
-        // I SHOULD REALLY CHANGE THIS BUT IT WORKS
-        $fileContent = json_decode(file_get_contents($file),true);
-        if(!$fileContent){
-            die("no config content");
-        }
-        $fileContent[$typeReset] = $resetArr;
-        file_put_contents($file,json_encode($fileContent));
-    }
-    function updateConfig($file, $originalDataArray){
-        $dataKey = $originalDataArray["3Dtype"];
-
-        $newDataArray = [$dataKey => []];
-
-        foreach($_POST as $key => $value){
-            if($key === "3Dtype") continue;
-
-            if(is_numeric($key)){
-                $newDataArray[$dataKey][] = (float)$value;
-            }
-        }
-
-        file_put_contents($file, json_encode($newDataArray));
-    }
-    init();
-    die();
-    ?>
-</div>
 </body>
 </html>
